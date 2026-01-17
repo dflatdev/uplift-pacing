@@ -1,0 +1,45 @@
+{
+    "expo": {
+          "name": "Uplift",
+          "slug": "uplift",
+          "version": "1.0.0",
+          "orientation": "portrait",
+          "icon": "./assets/icon.png",
+          "userInterfaceStyle": "automatic",
+          "splash": {
+                  "image": "./assets/splash.png",
+                  "resizeMode": "contain",
+                  "backgroundColor": "#FFE5EC"
+          },
+          "assetBundlePatterns": ["**/*"],
+          "ios": {
+                  "supportsTablet": true,
+                  "bundleIdentifier": "com.uplift.app",
+                  "infoPlist": {
+                            "NSHealthShareUsageDescription": "Uplift needs access to your health data to track activity levels and help you pace your energy.",
+                            "NSHealthUpdateUsageDescription": "Uplift needs access to update your health data."
+                  }
+          },
+          "android": {
+                  "adaptiveIcon": {
+                            "foregroundImage": "./assets/adaptive-icon.png",
+                            "backgroundColor": "#FFE5EC"
+                  },
+                  "package": "com.uplift.app",
+                  "permissions": [
+                            "android.permission.health.READ_STEPS",
+                            "android.permission.health.READ_HEART_RATE",
+                            "android.permission.health.READ_SLEEP"
+                  ]
+          },
+          "web": {
+                  "favicon": "./assets/favicon.png"
+          },
+          "plugins": ["expo-notifications"],
+          "extra": {
+                  "eas": {
+                            "projectId": "your-project-id"
+                  }
+          }
+    }
+}
