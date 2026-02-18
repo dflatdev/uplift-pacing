@@ -227,3 +227,27 @@ export const getNightlySummaries = async () => {
 
   return summaries;
 };
+
+export const getMorningCheckinByDate = async (date) =>
+  getFirstAsync(
+    'SELECT date, sleep_quality, energy_level FROM morning_checkins WHERE date = ?;',
+    [date]
+  );
+
+export const getNightlyCheckinByDate = async (date) =>
+  getFirstAsync(
+    `SELECT id, date, crash_occurred, crash_severity, crash_description,
+      energy_assessment, energy_current_state, energy_recovery_needed,
+      supportive_message
+      FROM nightly_checkins WHERE date = ?;`,
+    [date]
+  );
+
+export const getActivitiesByDate = async (date) =>
+  getAllAsync(
+    `SELECT id, name, effort_json, duration_minutes, difficulty_noted, notes
+      FROM activities
+      WHERE checkin_id = (SELECT id FROM nightly_checkins WHERE date = ?)
+      ORDER BY id;`,
+    [date]
+  );

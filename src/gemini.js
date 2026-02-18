@@ -1,6 +1,6 @@
 const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
 const GEMINI_MODEL =
-  process.env.EXPO_PUBLIC_GEMINI_MODEL ?? 'gemini-1.5-flash';
+  process.env.EXPO_PUBLIC_GEMINI_MODEL ?? 'gemini-2.5-flash';
 
 const buildPrompt = (date, userText) => `
 You are the evening check-in assistant for Uplift, an app helping people with chronic fatigue and ME/CFS manage energy and avoid PEM.

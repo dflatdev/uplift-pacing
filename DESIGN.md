@@ -188,6 +188,12 @@ The conversational check-in needs an LLM that can extract structured activity da
 
 The API key is stored in the app (acceptable for personal use). If the app ever goes multi-user, move API calls behind a backend.
 
+#### AI Check-in Setup
+1. Copy `.env.example` to `.env`.
+2. Set `EXPO_PUBLIC_GEMINI_API_KEY` to your Gemini API key.
+3. (Optional) Set `EXPO_PUBLIC_GEMINI_MODEL` to a specific model (defaults to `gemini-1.5-flash`).
+4. Restart `expo start` so the env vars are loaded.
+
 #### Structured Output
 Use the LLM's function calling / tool use to extract activities reliably:
 ```json

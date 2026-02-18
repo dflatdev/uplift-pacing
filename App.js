@@ -1,5 +1,6 @@
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -15,6 +16,9 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
+  getActivitiesByDate,
+  getMorningCheckinByDate,
+  getNightlyCheckinByDate,
   getNightlySummaries,
   initDb,
   saveMorningCheckin,
@@ -23,6 +27,27 @@ import {
 import { generateNightlySummary } from './src/gemini';
 
 const todayString = () => new Date().toISOString().slice(0, 10);
+const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const ACTIVITY_ICON_MAP = {
+  physical: 'run',
+  cognitive: 'brain',
+  social: 'account-group',
+  sensory: 'eye-outline',
+  emotional: 'heart-outline',
+};
+const DEFAULT_ACTIVITY_ICON = 'calendar-check';
+
+const getActivityIconName = (category) =>
+  ACTIVITY_ICON_MAP[category] ?? DEFAULT_ACTIVITY_ICON;
+
+const getPrimaryEffortCategory = (effortJson) => {
+  const effortList = JSON.parse(effortJson ?? '[]');
+  if (!Array.isArray(effortList)) {
+    return null;
+  }
+  const effortEntry = effortList.find((entry) => entry?.category);
+  return effortEntry?.category ?? null;
+};
 
 const getPromptMode = () => {
   const hour = new Date().getHours();
@@ -40,18 +65,18 @@ const getHeroAssets = () => {
   if (hour < 12) {
     return {
       balloon: require('./assets-src/air_balloon_close_morning.png'),
-      bubble: require('./assets-src/ready_for_adventure_bubble.png'),
+      bubbleText: 'Ready for adventure?',
     };
   }
   if (hour >= 17) {
     return {
       balloon: require('./assets-src/air_balloon_close_night.png'),
-      bubble: require('./assets-src/time_for_checkin_bubble.png'),
+      bubbleText: 'Time for check-in',
     };
   }
   return {
     balloon: require('./assets-src/air_balloon_day.png'),
-    bubble: require('./assets-src/time_for_checkin_bubble.png'),
+    bubbleText: 'Time for check-in',
   };
 };
 
@@ -91,36 +116,43 @@ const RatingRow = ({ label, value, onChange }) => (
 
 const BalloonHero = ({
   height,
+  width,
   balloonSource,
-  bubbleSource,
+  bubbleText,
   balloonSize,
   bubbleSize,
   onPress,
-}) => (
-  <Pressable style={[styles.hero, { height }]} onPress={onPress}>
-    <Image
-      source={balloonSource}
-      style={[styles.balloonImage, balloonSize]}
-      resizeMode="contain"
-    />
-    <Image
-      source={bubbleSource}
-      style={[styles.bubbleImage, bubbleSize]}
-      resizeMode="contain"
-    />
-    <Text style={styles.heroHint}>Tap the balloon to check in</Text>
-  </Pressable>
-);
+}) => {
+  const bubbleLayout = bubbleSize
+    ? { maxWidth: bubbleSize.width, minHeight: bubbleSize.height }
+    : null;
+  return (
+    <Pressable style={[styles.hero, { height, width }]} onPress={onPress}>
+      <Image
+        source={balloonSource}
+        style={[styles.balloonImage, balloonSize]}
+        resizeMode="contain"
+      />
+      {bubbleText ? (
+        <View style={[styles.bubbleContainer, bubbleLayout]}>
+          <Text style={styles.bubbleText}>{bubbleText}</Text>
+          <View style={styles.bubbleTail} />
+        </View>
+      ) : null}
+    </Pressable>
+  );
+};
 
 export default function App() {
-  const { height, width } = useWindowDimensions();
-  const heroHeight = Math.max(280, Math.floor(height * 0.45));
-  const gridColumns = 7;
+  const { width } = useWindowDimensions();
+  const gridColumns = 5;
   const gridGap = 8;
   const gridPadding = 20;
-  const daySize = Math.floor(
-    (width - gridPadding * 2 - gridGap * (gridColumns - 1)) / gridColumns
-  );
+  const todayScale = 1.3;
+  const availableGridWidth =
+    width - gridPadding * 2 - gridGap * (gridColumns - 1);
+  const daySize = Math.floor(availableGridWidth / (gridColumns - 1 + todayScale));
+  const todaySize = Math.floor(daySize * todayScale);
 
   const [dbReady, setDbReady] = useState(false);
   const [error, setError] = useState('');
@@ -134,13 +166,24 @@ export default function App() {
   const [loadingSummary, setLoadingSummary] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
   const [promptMode, setPromptMode] = useState(getPromptMode());
+  const [selectedDate, setSelectedDate] = useState(todayString());
+  const [selectedMorning, setSelectedMorning] = useState(null);
+  const [selectedNightly, setSelectedNightly] = useState(null);
+  const [selectedActivities, setSelectedActivities] = useState([]);
+  const historyScrollRef = useRef(null);
 
   const today = useMemo(() => todayString(), []);
   const geminiKeyMissing = !process.env.EXPO_PUBLIC_GEMINI_API_KEY;
   const heroAssets = getHeroAssets();
+  const balloonAsset = Image.resolveAssetSource(heroAssets.balloon);
+  const balloonAspectRatio =
+    balloonAsset?.width && balloonAsset?.height
+      ? balloonAsset.width / balloonAsset.height
+      : 1;
+  const heroHeight = Math.floor(width / balloonAspectRatio);
   const balloonSize = {
-    width: Math.min(320, Math.floor(width * 0.75)),
-    height: Math.floor(heroHeight * 0.7),
+    width,
+    height: heroHeight,
   };
   const bubbleSize = {
     width: Math.min(220, Math.floor(width * 0.5)),
@@ -157,22 +200,52 @@ export default function App() {
 
   const historyDays = useMemo(() => {
     const days = [];
-    for (let i = 27; i >= 0; i -= 1) {
+    for (let i = 9; i >= 0; i -= 1) {
       const date = new Date();
       date.setDate(date.getDate() - i);
       const dateString = date.toISOString().slice(0, 10);
       days.push({
         date: dateString,
-        day: date.getDate(),
+        dayLabel: WEEKDAY_LABELS[date.getDay()],
+        isToday: i === 0,
         overall: historyByDate[dateString] ?? 'none',
       });
     }
     return days;
   }, [historyByDate]);
 
+  const selectedDayLabel = useMemo(() => {
+    const selectedEntry = historyDays.find((day) => day.date === selectedDate);
+    if (selectedEntry?.isToday) {
+      return 'Today';
+    }
+    return selectedEntry?.dayLabel ?? selectedDate;
+  }, [historyDays, selectedDate]);
+
   const loadHistory = async () => {
     const summaries = await getNightlySummaries();
     setHistory(summaries);
+  };
+
+  const loadSelectedDay = async (date) => {
+    try {
+      const [morning, nightly, activities] = await Promise.all([
+        getMorningCheckinByDate(date),
+        getNightlyCheckinByDate(date),
+        getActivitiesByDate(date),
+      ]);
+      setSelectedMorning(morning ?? null);
+      setSelectedNightly(nightly ?? null);
+      const normalizedActivities = Array.isArray(activities)
+        ? activities.map((activity) => ({
+            ...activity,
+            primaryEffortCategory: getPrimaryEffortCategory(activity.effort_json),
+          }))
+        : [];
+      setSelectedActivities(normalizedActivities);
+    } catch (loadError) {
+      setError(loadError.message);
+    }
   };
 
   useEffect(() => {
@@ -194,6 +267,13 @@ export default function App() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!dbReady) {
+      return;
+    }
+    loadSelectedDay(selectedDate);
+  }, [dbReady, selectedDate]);
 
   const handleOpenPrompt = () => {
     setError('');
@@ -217,6 +297,7 @@ export default function App() {
         energyLevel,
       });
       setStatus('Morning check-in saved.');
+      await loadSelectedDay(selectedDate);
     } catch (saveError) {
       setError(saveError.message);
     }
@@ -256,6 +337,7 @@ export default function App() {
       });
       setStatus('Nightly check-in saved.');
       await loadHistory();
+      await loadSelectedDay(selectedDate);
     } catch (summaryError) {
       setError(summaryError.message);
     } finally {
@@ -264,8 +346,18 @@ export default function App() {
   };
 
   const renderHistoryGrid = () => (
-    <View style={styles.historyGrid}>
+    <ScrollView
+      horizontal
+      ref={historyScrollRef}
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.historyGrid}
+      onContentSizeChange={() =>
+        historyScrollRef.current?.scrollToEnd({ animated: false })
+      }
+    >
       {historyDays.map((day) => {
+        const cellSize = day.isToday ? todaySize : daySize;
+        const isSelected = day.date === selectedDate;
         const backgroundColor =
           day.overall === 'green'
             ? '#6fcb8f'
@@ -275,17 +367,106 @@ export default function App() {
             ? '#e26d67'
             : '#e6e6e6';
         return (
-          <View
+          <Pressable
             key={day.date}
-            style={[
-              styles.dayCell,
-              { width: daySize, height: daySize, backgroundColor },
-            ]}
+            onPress={() => setSelectedDate(day.date)}
+            style={styles.historyItem}
           >
-            <Text style={styles.dayLabel}>{day.day}</Text>
-          </View>
+            <Text
+              style={[styles.dayLabel, day.isToday && styles.dayLabelToday]}
+            >
+              {day.isToday ? 'Today' : day.dayLabel}
+            </Text>
+            <View
+              style={[
+                styles.dayCell,
+                isSelected && styles.dayCellSelected,
+                { width: cellSize, height: cellSize, backgroundColor },
+              ]}
+            />
+          </Pressable>
         );
       })}
+    </ScrollView>
+  );
+
+  const renderSelectedDayPanel = () => (
+    <View style={styles.selectedDayPanel}>
+      <Text style={styles.selectedDayTitle}>{selectedDayLabel}</Text>
+      <View style={styles.selectedDaySection}>
+        <Text style={styles.selectedDaySectionTitle}>Morning check-in</Text>
+        {selectedMorning ? (
+          <>
+            <Text style={styles.detailText}>
+              Sleep quality: {selectedMorning.sleep_quality}
+            </Text>
+            <Text style={styles.detailText}>
+              Energy level: {selectedMorning.energy_level}
+            </Text>
+          </>
+        ) : (
+          <Text style={styles.subtleText}>No morning check-in yet.</Text>
+        )}
+      </View>
+      <View style={styles.selectedDaySection}>
+        <Text style={styles.selectedDaySectionTitle}>Evening check-in</Text>
+        {selectedNightly ? (
+          <>
+            {selectedNightly.energy_assessment ? (
+              <Text style={styles.detailText}>
+                Energy balance: {selectedNightly.energy_assessment}
+              </Text>
+            ) : null}
+            {selectedNightly.energy_current_state ? (
+              <Text style={styles.detailText}>
+                Current state: {selectedNightly.energy_current_state}
+              </Text>
+            ) : null}
+            {selectedNightly.crash_occurred ? (
+              <Text style={styles.detailText}>
+                Crash: {selectedNightly.crash_severity ?? 'noted'}
+              </Text>
+            ) : null}
+            {selectedNightly.supportive_message ? (
+              <Text style={styles.supportiveText}>
+                {selectedNightly.supportive_message}
+              </Text>
+            ) : null}
+          </>
+        ) : (
+          <Text style={styles.subtleText}>No evening check-in yet.</Text>
+        )}
+      </View>
+      <View style={styles.selectedDaySection}>
+        <Text style={styles.selectedDaySectionTitle}>Activities</Text>
+        {selectedActivities.length ? (
+          selectedActivities.map((activity) => (
+            <View key={activity.id} style={styles.activityItem}>
+              <View style={styles.activityHeader}>
+                <MaterialCommunityIcons
+                  name={getActivityIconName(activity.primaryEffortCategory)}
+                  size={18}
+                  style={styles.activityIcon}
+                />
+                <Text style={styles.activityName}>{activity.name}</Text>
+              </View>
+              {activity.duration_minutes ? (
+                <Text style={styles.activityMeta}>
+                  Duration: {activity.duration_minutes} min
+                </Text>
+              ) : null}
+              {activity.difficulty_noted ? (
+                <Text style={styles.activityMeta}>Noted difficulty</Text>
+              ) : null}
+              {activity.notes ? (
+                <Text style={styles.activityMeta}>{activity.notes}</Text>
+              ) : null}
+            </View>
+          ))
+        ) : (
+          <Text style={styles.subtleText}>No activities logged.</Text>
+        )}
+      </View>
     </View>
   );
 
@@ -422,17 +603,18 @@ export default function App() {
       <SafeAreaView style={[styles.container, styles.homeContainer]}>
         <ExpoStatusBar style="auto" />
         <ScrollView contentContainerStyle={styles.mainContent}>
-          <BalloonHero
-            height={heroHeight}
-            balloonSource={heroAssets.balloon}
-            bubbleSource={heroAssets.bubble}
-            balloonSize={balloonSize}
-            bubbleSize={bubbleSize}
-            onPress={handleOpenPrompt}
-          />
+        <BalloonHero
+          height={heroHeight}
+          width={width}
+          balloonSource={heroAssets.balloon}
+          bubbleText={heroAssets.bubbleText}
+          balloonSize={balloonSize}
+          bubbleSize={bubbleSize}
+          onPress={handleOpenPrompt}
+        />
           <View style={styles.calendarSection}>
-            <Text style={styles.calendarTitle}>Day history</Text>
             {renderHistoryGrid()}
+            {renderSelectedDayPanel()}
           </View>
           {status ? <Text style={styles.statusText}>{status}</Text> : null}
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
@@ -465,10 +647,41 @@ const styles = StyleSheet.create({
   balloonImage: {
     marginTop: 8,
   },
-  bubbleImage: {
+  bubbleContainer: {
     position: 'absolute',
     right: 12,
     bottom: 60,
+    backgroundColor: '#ffffff',
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 2,
+    overflow: 'visible',
+  },
+  bubbleText: {
+    color: '#2b2b2b',
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  bubbleTail: {
+    position: 'absolute',
+    bottom: -10,
+    right: 24,
+    width: 0,
+    height: 0,
+    borderTopWidth: 10,
+    borderTopColor: '#ffffff',
+    borderLeftWidth: 8,
+    borderLeftColor: 'transparent',
+    borderRightWidth: 8,
+    borderRightColor: 'transparent',
   },
   heroHint: {
     marginTop: 10,
@@ -493,18 +706,76 @@ const styles = StyleSheet.create({
   },
   historyGrid: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
+    flexWrap: 'nowrap',
+    alignItems: 'flex-end',
+    flexGrow: 1,
+    justifyContent: 'flex-end',
     gap: 8,
+  },
+  historyItem: {
+    alignItems: 'center',
   },
   dayCell: {
     borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
+  },
+  dayCellSelected: {
+    borderWidth: 2,
+    borderColor: '#1f2a3a',
   },
   dayLabel: {
     color: '#2f2f2f',
     fontSize: 12,
     fontWeight: '600',
+    marginBottom: 6,
+  },
+  dayLabelToday: {
+    color: '#1f2a3a',
+    fontWeight: '700',
+  },
+  selectedDayPanel: {
+    marginTop: 12,
+    backgroundColor: '#f7f8fb',
+    borderRadius: 16,
+    padding: 12,
+  },
+  selectedDayTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#2b2b2b',
+    marginBottom: 10,
+  },
+  selectedDaySection: {
+    marginBottom: 12,
+  },
+  selectedDaySectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#2b2b2b',
+    marginBottom: 6,
+  },
+  detailText: {
+    color: '#4a4a4a',
+    marginBottom: 4,
+  },
+  activityItem: {
+    marginBottom: 8,
+  },
+  activityHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  activityIcon: {
+    color: '#5b6b7f',
+  },
+  activityName: {
+    color: '#2b2b2b',
+    fontWeight: '600',
+  },
+  activityMeta: {
+    color: '#6b6b6b',
+    fontSize: 12,
+    marginTop: 2,
   },
   section: {
     backgroundColor: '#ffffff',
