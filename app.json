@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Uplift",
-    "slug": "uplift",
+    "slug": "uplift-pacing",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -20,13 +20,21 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.dflatdevelopment.upliftpacing"
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      "expo-dev-client",
       "expo-sqlite"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "48a601f2-f829-4411-8eea-d57c3195f582"
+      }
+    },
+    "owner": "dflatdevelopment"
   }
 }

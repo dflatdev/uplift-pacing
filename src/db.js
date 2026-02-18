@@ -82,6 +82,13 @@ export const initDb = async () => {
       description TEXT,
       related_activities TEXT
     );
+    CREATE TABLE IF NOT EXISTS checkin_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      user_text TEXT NOT NULL,
+      summary_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 };
 
@@ -99,7 +106,12 @@ export const saveMorningCheckin = async ({
   );
 };
 
-export const upsertNightlyCheckin = async ({ date, isBackdated, summary }) => {
+export const upsertNightlyCheckin = async ({
+  date,
+  isBackdated,
+  summary,
+  mergeActivities = false,
+}) => {
   const timestamp = new Date().toISOString();
   const crash = summary?.crash ?? {};
   const energy = summary?.energy_balance ?? {};
@@ -108,34 +120,49 @@ export const upsertNightlyCheckin = async ({ date, isBackdated, summary }) => {
     [date]
   );
   if (existing?.id) {
-    await runAsync('DELETE FROM activities WHERE checkin_id = ?;', [
-      existing.id,
-    ]);
-    await runAsync('DELETE FROM warning_flags WHERE checkin_id = ?;', [
-      existing.id,
-    ]);
+    await runAsync(
+      `UPDATE nightly_checkins
+        SET is_backdated = ?, crash_occurred = ?, crash_severity = ?,
+          crash_description = ?, energy_assessment = ?, energy_current_state = ?,
+          energy_recovery_needed = ?, supportive_message = ?, summary_json = ?,
+          created_at = ?
+        WHERE id = ?;`,
+      [
+        isBackdated ? 1 : 0,
+        crash.occurred ? 1 : 0,
+        crash.severity ?? null,
+        crash.description ?? null,
+        energy.assessment ?? null,
+        energy.current_state ?? null,
+        energy.recovery_needed ? 1 : 0,
+        summary?.supportive_message ?? null,
+        JSON.stringify(summary ?? {}),
+        timestamp,
+        existing.id,
+      ]
+    );
+  } else {
+    await runAsync(
+      `INSERT INTO nightly_checkins
+        (date, is_backdated, crash_occurred, crash_severity, crash_description,
+        energy_assessment, energy_current_state, energy_recovery_needed,
+        supportive_message, summary_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+      [
+        date,
+        isBackdated ? 1 : 0,
+        crash.occurred ? 1 : 0,
+        crash.severity ?? null,
+        crash.description ?? null,
+        energy.assessment ?? null,
+        energy.current_state ?? null,
+        energy.recovery_needed ? 1 : 0,
+        summary?.supportive_message ?? null,
+        JSON.stringify(summary ?? {}),
+        timestamp,
+      ]
+    );
   }
-
-  await runAsync(
-    `INSERT OR REPLACE INTO nightly_checkins
-      (date, is_backdated, crash_occurred, crash_severity, crash_description,
-       energy_assessment, energy_current_state, energy_recovery_needed,
-       supportive_message, summary_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-    [
-      date,
-      isBackdated ? 1 : 0,
-      crash.occurred ? 1 : 0,
-      crash.severity ?? null,
-      crash.description ?? null,
-      energy.assessment ?? null,
-      energy.current_state ?? null,
-      energy.recovery_needed ? 1 : 0,
-      summary?.supportive_message ?? null,
-      JSON.stringify(summary ?? {}),
-      timestamp,
-    ]
-  );
 
   const checkinResult = await getFirstAsync(
     'SELECT id FROM nightly_checkins WHERE date = ?;',
@@ -146,17 +173,50 @@ export const upsertNightlyCheckin = async ({ date, isBackdated, summary }) => {
   }
   const checkinId = checkinResult.id;
 
+  if (existing?.id) {
+    await runAsync('DELETE FROM warning_flags WHERE checkin_id = ?;', [
+      existing.id,
+    ]);
+    if (!mergeActivities) {
+      await runAsync('DELETE FROM activities WHERE checkin_id = ?;', [
+        existing.id,
+      ]);
+    }
+  }
+
   const activities = Array.isArray(summary?.activities)
     ? summary.activities
     : [];
   for (const activity of activities) {
+    const activityName = activity.name ?? 'Activity';
+    if (mergeActivities) {
+      const existingActivity = await getFirstAsync(
+        'SELECT id FROM activities WHERE checkin_id = ? AND name = ?;',
+        [checkinId, activityName]
+      );
+      if (existingActivity?.id) {
+        await runAsync(
+          `UPDATE activities
+            SET effort_json = ?, duration_minutes = ?, difficulty_noted = ?, notes = ?
+            WHERE id = ?;`,
+          [
+            JSON.stringify(activity.effort ?? []),
+            activity.duration_minutes ?? null,
+            activity.difficulty_noted ? 1 : 0,
+            activity.notes ?? null,
+            existingActivity.id,
+          ]
+        );
+        continue;
+      }
+    }
     await runAsync(
       `INSERT INTO activities
         (checkin_id, name, effort_json, duration_minutes, difficulty_noted, notes)
         VALUES (?, ?, ?, ?, ?, ?);`,
       [
         checkinId,
-        activity.name ?? 'Activity',
+        activityName,
         JSON.stringify(activity.effort ?? []),
         activity.duration_minutes ?? null,
         activity.difficulty_noted ? 1 : 0,
@@ -184,43 +244,79 @@ export const upsertNightlyCheckin = async ({ date, isBackdated, summary }) => {
   }
 };
 
+export const saveCheckinEntry = async ({ date, userText, summary }) => {
+  const timestamp = new Date().toISOString();
+  await runAsync(
+    `INSERT INTO checkin_entries
+      (date, user_text, summary_json, created_at)
+      VALUES (?, ?, ?, ?);`,
+    [date, userText, JSON.stringify(summary ?? {}), timestamp]
+  );
+};
+
+export const getCheckinsByDate = async (date) =>
+  getAllAsync(
+    `SELECT id, user_text, created_at
+      FROM checkin_entries
+      WHERE date = ?
+      ORDER BY created_at DESC;`,
+    [date]
+  );
+
 export const getNightlySummaries = async () => {
   const result = await getAllAsync(
-    'SELECT id, date, crash_occurred FROM nightly_checkins ORDER BY date DESC;'
+    `SELECT id, date, crash_occurred, crash_severity, energy_assessment
+      FROM nightly_checkins ORDER BY date DESC;`
   );
   const summaries = [];
+  const heavyCrashKeywords = [
+    'severe',
+    'heavy',
+    'significant',
+    'major',
+    'extreme',
+    'high',
+  ];
 
   for (let i = 0; i < result.length; i += 1) {
     const row = result[i];
-    const activityResult = await getAllAsync(
-      'SELECT effort_json FROM activities WHERE checkin_id = ?;',
+    const warningResult = await getAllAsync(
+      'SELECT severity FROM warning_flags WHERE checkin_id = ?;',
       [row.id]
     );
-    let hasYellow = false;
-    let hasRed = false;
-    for (let j = 0; j < activityResult.length; j += 1) {
-      const effortJson = activityResult[j].effort_json;
-      try {
-        const effortList = JSON.parse(effortJson ?? '[]');
-        for (const effort of effortList) {
-          if (effort.color === 'red') {
-            hasRed = true;
-          } else if (effort.color === 'yellow') {
-            hasYellow = true;
-          }
-        }
-      } catch (parseError) {
-        hasYellow = true;
+    let hasHighWarning = false;
+    let hasMediumWarning = false;
+    for (let j = 0; j < warningResult.length; j += 1) {
+      const severity = warningResult[j].severity;
+      if (severity === 'high') {
+        hasHighWarning = true;
+      } else if (severity === 'medium') {
+        hasMediumWarning = true;
       }
     }
 
-    const overall = row.crash_occurred
-      ? 'red'
-      : hasRed
-      ? 'red'
-      : hasYellow
-      ? 'yellow'
-      : 'green';
+    const crashSeverity =
+      typeof row.crash_severity === 'string'
+        ? row.crash_severity.toLowerCase()
+        : '';
+    const hasHeavyCrash =
+      row.crash_occurred &&
+      heavyCrashKeywords.some((keyword) => crashSeverity.includes(keyword));
+    const energyAssessment =
+      typeof row.energy_assessment === 'string'
+        ? row.energy_assessment.toLowerCase()
+        : '';
+    const hasSignificantOverwork =
+      energyAssessment === 'significant_deficit' || hasHighWarning;
+    const hasMinorCrash = row.crash_occurred && !hasHeavyCrash;
+    const hasSignificantWorry = hasMediumWarning;
+
+    const overall =
+      hasHeavyCrash || hasSignificantOverwork
+        ? 'red'
+        : hasMinorCrash || hasSignificantWorry
+        ? 'yellow'
+        : 'green';
 
     summaries.push({ date: row.date, overall });
   }

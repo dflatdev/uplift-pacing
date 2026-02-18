@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
@@ -17,11 +18,11 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
   getActivitiesByDate,
-  getMorningCheckinByDate,
+  getCheckinsByDate,
   getNightlyCheckinByDate,
   getNightlySummaries,
   initDb,
-  saveMorningCheckin,
+  saveCheckinEntry,
   upsertNightlyCheckin,
 } from './src/db';
 import { generateNightlySummary } from './src/gemini';
@@ -40,6 +41,30 @@ const DEFAULT_ACTIVITY_ICON = 'calendar-check';
 const getActivityIconName = (category) =>
   ACTIVITY_ICON_MAP[category] ?? DEFAULT_ACTIVITY_ICON;
 
+const formatTime = (timestamp) =>
+  new Date(timestamp).toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+
+const formatRelativeDays = (dateString, timestamp) => {
+  const baseDate = new Date(dateString);
+  const createdDate = new Date(timestamp);
+  baseDate.setHours(0, 0, 0, 0);
+  createdDate.setHours(0, 0, 0, 0);
+  const diffDays = Math.max(
+    0,
+    Math.round((createdDate - baseDate) / (24 * 60 * 60 * 1000))
+  );
+  if (diffDays === 0) {
+    return 'Same day';
+  }
+  if (diffDays === 1) {
+    return '1 day later';
+  }
+  return `${diffDays} days later`;
+};
+
 const getPrimaryEffortCategory = (effortJson) => {
   const effortList = JSON.parse(effortJson ?? '[]');
   if (!Array.isArray(effortList)) {
@@ -47,17 +72,6 @@ const getPrimaryEffortCategory = (effortJson) => {
   }
   const effortEntry = effortList.find((entry) => entry?.category);
   return effortEntry?.category ?? null;
-};
-
-const getPromptMode = () => {
-  const hour = new Date().getHours();
-  if (hour < 12) {
-    return 'morning';
-  }
-  if (hour >= 17) {
-    return 'night';
-  }
-  return 'choose';
 };
 
 const getHeroAssets = () => {
@@ -79,40 +93,6 @@ const getHeroAssets = () => {
     bubbleText: 'Time for check-in',
   };
 };
-
-const Section = ({ title, children }) => (
-  <View style={styles.section}>
-    <Text style={styles.sectionTitle}>{title}</Text>
-    {children}
-  </View>
-);
-
-const RatingRow = ({ label, value, onChange }) => (
-  <View style={styles.row}>
-    <Text style={styles.label}>{label}</Text>
-    <View style={styles.ratingRow}>
-      {[1, 2, 3, 4, 5].map((rating) => (
-        <Pressable
-          key={rating}
-          onPress={() => onChange(rating)}
-          style={[
-            styles.ratingButton,
-            value === rating && styles.ratingButtonActive,
-          ]}
-        >
-          <Text
-            style={[
-              styles.ratingText,
-              value === rating && styles.ratingTextActive,
-            ]}
-          >
-            {rating}
-          </Text>
-        </Pressable>
-      ))}
-    </View>
-  </View>
-);
 
 const BalloonHero = ({
   height,
@@ -157,23 +137,20 @@ export default function App() {
   const [dbReady, setDbReady] = useState(false);
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
-  const [sleepQuality, setSleepQuality] = useState(3);
-  const [energyLevel, setEnergyLevel] = useState(3);
-  const [nightlyDate, setNightlyDate] = useState(todayString());
-  const [nightlyText, setNightlyText] = useState('');
-  const [nightlySummary, setNightlySummary] = useState(null);
+  const [checkinText, setCheckinText] = useState('');
+  const [submittingCheckin, setSubmittingCheckin] = useState(false);
   const [history, setHistory] = useState([]);
-  const [loadingSummary, setLoadingSummary] = useState(false);
-  const [showPrompt, setShowPrompt] = useState(false);
-  const [promptMode, setPromptMode] = useState(getPromptMode());
   const [selectedDate, setSelectedDate] = useState(todayString());
-  const [selectedMorning, setSelectedMorning] = useState(null);
   const [selectedNightly, setSelectedNightly] = useState(null);
   const [selectedActivities, setSelectedActivities] = useState([]);
+  const [selectedCheckins, setSelectedCheckins] = useState([]);
   const historyScrollRef = useRef(null);
 
   const today = useMemo(() => todayString(), []);
   const geminiKeyMissing = !process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+  const isSubmitDisabled =
+    submittingCheckin || geminiKeyMissing || !checkinText.trim();
+  const isBackdatedView = selectedDate !== today;
   const heroAssets = getHeroAssets();
   const balloonAsset = Image.resolveAssetSource(heroAssets.balloon);
   const balloonAspectRatio =
@@ -229,12 +206,11 @@ export default function App() {
 
   const loadSelectedDay = async (date) => {
     try {
-      const [morning, nightly, activities] = await Promise.all([
-        getMorningCheckinByDate(date),
+      const [nightly, activities, checkins] = await Promise.all([
         getNightlyCheckinByDate(date),
         getActivitiesByDate(date),
+        getCheckinsByDate(date),
       ]);
-      setSelectedMorning(morning ?? null);
       setSelectedNightly(nightly ?? null);
       const normalizedActivities = Array.isArray(activities)
         ? activities.map((activity) => ({
@@ -243,6 +219,7 @@ export default function App() {
           }))
         : [];
       setSelectedActivities(normalizedActivities);
+      setSelectedCheckins(Array.isArray(checkins) ? checkins : []);
     } catch (loadError) {
       setError(loadError.message);
     }
@@ -275,73 +252,46 @@ export default function App() {
     loadSelectedDay(selectedDate);
   }, [dbReady, selectedDate]);
 
-  const handleOpenPrompt = () => {
+  const handleSubmitCheckin = async () => {
     setError('');
     setStatus('');
-    setPromptMode(getPromptMode());
-    setNightlyDate(todayString());
-    setShowPrompt(true);
-  };
-
-  const handleClosePrompt = () => {
-    setShowPrompt(false);
-  };
-
-  const handleSaveMorning = async () => {
-    setError('');
-    setStatus('');
-    try {
-      await saveMorningCheckin({
-        date: todayString(),
-        sleepQuality,
-        energyLevel,
-      });
-      setStatus('Morning check-in saved.');
-      await loadSelectedDay(selectedDate);
-    } catch (saveError) {
-      setError(saveError.message);
-    }
-  };
-
-  const handleGenerateNightly = async () => {
-    setError('');
-    setStatus('');
-    setNightlySummary(null);
 
     if (geminiKeyMissing) {
       setError('Missing EXPO_PUBLIC_GEMINI_API_KEY in .env.');
       return;
     }
 
-    if (!nightlyText.trim()) {
-      setError('Please enter a short summary of your day.');
+    const trimmedText = checkinText.trim();
+    if (!trimmedText) {
+      setError('');
       return;
     }
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(nightlyDate)) {
-      setError('Nightly date must be in YYYY-MM-DD format.');
-      return;
-    }
-
-    setLoadingSummary(true);
+    setSubmittingCheckin(true);
     try {
       const summary = await generateNightlySummary({
-        date: nightlyDate,
-        userText: nightlyText,
+        date: selectedDate,
+        userText: trimmedText,
       });
-      setNightlySummary(summary);
       await upsertNightlyCheckin({
-        date: nightlyDate,
-        isBackdated: nightlyDate !== today,
+        date: selectedDate,
+        isBackdated: selectedDate !== today,
+        summary,
+        mergeActivities: true,
+      });
+      await saveCheckinEntry({
+        date: selectedDate,
+        userText: trimmedText,
         summary,
       });
-      setStatus('Nightly check-in saved.');
+      setCheckinText('');
+      setStatus('Check-in saved.');
       await loadHistory();
       await loadSelectedDay(selectedDate);
     } catch (summaryError) {
       setError(summaryError.message);
     } finally {
-      setLoadingSummary(false);
+      setSubmittingCheckin(false);
     }
   };
 
@@ -394,22 +344,7 @@ export default function App() {
     <View style={styles.selectedDayPanel}>
       <Text style={styles.selectedDayTitle}>{selectedDayLabel}</Text>
       <View style={styles.selectedDaySection}>
-        <Text style={styles.selectedDaySectionTitle}>Morning check-in</Text>
-        {selectedMorning ? (
-          <>
-            <Text style={styles.detailText}>
-              Sleep quality: {selectedMorning.sleep_quality}
-            </Text>
-            <Text style={styles.detailText}>
-              Energy level: {selectedMorning.energy_level}
-            </Text>
-          </>
-        ) : (
-          <Text style={styles.subtleText}>No morning check-in yet.</Text>
-        )}
-      </View>
-      <View style={styles.selectedDaySection}>
-        <Text style={styles.selectedDaySectionTitle}>Evening check-in</Text>
+        <Text style={styles.selectedDaySectionTitle}>Day summary</Text>
         {selectedNightly ? (
           <>
             {selectedNightly.energy_assessment ? (
@@ -434,7 +369,24 @@ export default function App() {
             ) : null}
           </>
         ) : (
-          <Text style={styles.subtleText}>No evening check-in yet.</Text>
+          <Text style={styles.subtleText}>No summary yet.</Text>
+        )}
+      </View>
+      <View style={styles.selectedDaySection}>
+        <Text style={styles.selectedDaySectionTitle}>Check-ins</Text>
+        {selectedCheckins.length ? (
+          selectedCheckins.map((checkin) => (
+            <View key={checkin.id} style={styles.checkinItem}>
+              <Text style={styles.checkinTime}>
+                {isBackdatedView
+                  ? formatRelativeDays(selectedDate, checkin.created_at)
+                  : formatTime(checkin.created_at)}
+              </Text>
+              <Text style={styles.checkinText}>{checkin.user_text}</Text>
+            </View>
+          ))
+        ) : (
+          <Text style={styles.subtleText}>No check-ins yet.</Text>
         )}
       </View>
       <View style={styles.selectedDaySection}>
@@ -470,97 +422,6 @@ export default function App() {
     </View>
   );
 
-  const renderMorningSection = () => (
-    <Section title="Morning check-in">
-      <Text style={styles.subtleText}>Today: {today}</Text>
-      <RatingRow
-        label="Sleep quality"
-        value={sleepQuality}
-        onChange={setSleepQuality}
-      />
-      <RatingRow
-        label="Energy level"
-        value={energyLevel}
-        onChange={setEnergyLevel}
-      />
-      <Pressable style={styles.primaryButton} onPress={handleSaveMorning}>
-        <Text style={styles.primaryButtonText}>Save morning check-in</Text>
-      </Pressable>
-      <Pressable
-        style={styles.secondaryButton}
-        onPress={() => setPromptMode('night')}
-      >
-        <Text style={styles.secondaryButtonText}>Switch to nightly check-in</Text>
-      </Pressable>
-    </Section>
-  );
-
-  const renderNightlySection = () => (
-    <Section title="Nightly check-in">
-      <Text style={styles.label}>Date (YYYY-MM-DD)</Text>
-      <TextInput
-        style={styles.input}
-        value={nightlyDate}
-        onChangeText={setNightlyDate}
-        placeholder="YYYY-MM-DD"
-      />
-      <Text style={styles.label}>What did you do today?</Text>
-      <TextInput
-        style={[styles.input, styles.textArea]}
-        value={nightlyText}
-        onChangeText={setNightlyText}
-        placeholder="Share your day in a few sentences..."
-        multiline
-      />
-      <Pressable
-        style={[
-          styles.primaryButton,
-          (loadingSummary || geminiKeyMissing) && styles.primaryButtonDisabled,
-        ]}
-        onPress={handleGenerateNightly}
-        disabled={loadingSummary || geminiKeyMissing}
-      >
-        <Text style={styles.primaryButtonText}>
-          {loadingSummary ? 'Analyzing...' : 'Generate summary'}
-        </Text>
-      </Pressable>
-      {geminiKeyMissing ? (
-        <Text style={styles.warningText}>
-          Add EXPO_PUBLIC_GEMINI_API_KEY to .env to enable summaries.
-        </Text>
-      ) : null}
-      {nightlySummary?.supportive_message ? (
-        <Text style={styles.supportiveText}>
-          {nightlySummary.supportive_message}
-        </Text>
-      ) : null}
-      <Pressable
-        style={styles.secondaryButton}
-        onPress={() => setPromptMode('morning')}
-      >
-        <Text style={styles.secondaryButtonText}>Switch to morning check-in</Text>
-      </Pressable>
-    </Section>
-  );
-
-  const renderPromptSelector = () => (
-    <View style={styles.selector}>
-      <Text style={styles.selectorText}>Which check-in do you want to do?</Text>
-      <Pressable
-        style={styles.primaryButton}
-        onPress={() => setPromptMode('morning')}
-      >
-        <Text style={styles.primaryButtonText}>Morning check-in</Text>
-      </Pressable>
-      <Pressable
-        style={[styles.primaryButton, styles.secondaryButtonAlt]}
-        onPress={() => setPromptMode('night')}
-      >
-        <Text style={styles.primaryButtonText}>Nightly check-in</Text>
-      </Pressable>
-    </View>
-  );
-
   if (!dbReady) {
     return (
       <SafeAreaProvider>
@@ -575,43 +436,22 @@ export default function App() {
     );
   }
 
-  if (showPrompt) {
-    return (
-      <SafeAreaProvider>
-        <SafeAreaView style={styles.container}>
-          <ExpoStatusBar style="auto" />
-          <ScrollView contentContainerStyle={styles.promptContent}>
-            <View style={styles.promptHeader}>
-              <Pressable style={styles.backButton} onPress={handleClosePrompt}>
-                <Text style={styles.backButtonText}>Back</Text>
-              </Pressable>
-              <Text style={styles.promptTitle}>Check-in</Text>
-            </View>
-            {promptMode === 'choose' ? renderPromptSelector() : null}
-            {promptMode === 'morning' ? renderMorningSection() : null}
-            {promptMode === 'night' ? renderNightlySection() : null}
-            {status ? <Text style={styles.statusText}>{status}</Text> : null}
-            {error ? <Text style={styles.errorText}>{error}</Text> : null}
-          </ScrollView>
-        </SafeAreaView>
-      </SafeAreaProvider>
-    );
-  }
-
   return (
     <SafeAreaProvider>
       <SafeAreaView style={[styles.container, styles.homeContainer]}>
         <ExpoStatusBar style="auto" />
-        <ScrollView contentContainerStyle={styles.mainContent}>
-        <BalloonHero
-          height={heroHeight}
-          width={width}
-          balloonSource={heroAssets.balloon}
-          bubbleText={heroAssets.bubbleText}
-          balloonSize={balloonSize}
-          bubbleSize={bubbleSize}
-          onPress={handleOpenPrompt}
-        />
+        <ScrollView
+          style={styles.mainScroll}
+          contentContainerStyle={styles.mainContent}
+        >
+          <BalloonHero
+            height={heroHeight}
+            width={width}
+            balloonSource={heroAssets.balloon}
+            bubbleText={heroAssets.bubbleText}
+            balloonSize={balloonSize}
+            bubbleSize={bubbleSize}
+          />
           <View style={styles.calendarSection}>
             {renderHistoryGrid()}
             {renderSelectedDayPanel()}
@@ -619,6 +459,42 @@ export default function App() {
           {status ? <Text style={styles.statusText}>{status}</Text> : null}
           {error ? <Text style={styles.errorText}>{error}</Text> : null}
         </ScrollView>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : StatusBar.currentHeight ?? 0}
+        >
+          <View style={styles.bottomBar}>
+            <Text style={styles.bottomBarLabel}>
+              Check in for {selectedDayLabel}
+            </Text>
+            <View style={styles.bottomBarRow}>
+            <TextInput
+              style={styles.bottomBarInput}
+              value={checkinText}
+              onChangeText={setCheckinText}
+              placeholder="Add a quick check-in..."
+              multiline
+            />
+              <Pressable
+                style={[
+                  styles.bottomBarButton,
+                  isSubmitDisabled && styles.bottomBarButtonDisabled,
+                ]}
+                onPress={handleSubmitCheckin}
+                disabled={isSubmitDisabled}
+              >
+                <Text style={styles.bottomBarButtonText}>
+                  {submittingCheckin ? 'Saving' : 'Send'}
+                </Text>
+              </Pressable>
+            </View>
+            {geminiKeyMissing ? (
+              <Text style={styles.warningText}>
+                Add EXPO_PUBLIC_GEMINI_API_KEY to .env to enable summaries.
+              </Text>
+            ) : null}
+          </View>
+        </KeyboardAvoidingView>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -635,7 +511,10 @@ const styles = StyleSheet.create({
   },
   mainContent: {
     paddingHorizontal: 20,
-    paddingBottom: 32,
+    paddingBottom: 160,
+  },
+  mainScroll: {
+    flex: 1,
   },
   hero: {
     justifyContent: 'center',
@@ -746,6 +625,18 @@ const styles = StyleSheet.create({
   },
   selectedDaySection: {
     marginBottom: 12,
+  },
+  checkinItem: {
+    marginBottom: 8,
+  },
+  checkinTime: {
+    color: '#4a4a4a',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 2,
+  },
+  checkinText: {
+    color: '#4a4a4a',
   },
   selectedDaySectionTitle: {
     fontSize: 14,
@@ -876,6 +767,49 @@ const styles = StyleSheet.create({
   warningText: {
     marginTop: 10,
     color: '#b36b00',
+  },
+  bottomBar: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#e2e6f2',
+    backgroundColor: '#ffffff',
+  },
+  bottomBarLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#2b2b2b',
+    marginBottom: 8,
+  },
+  bottomBarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  bottomBarInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#d0d0d0',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: '#fafafa',
+    minHeight: 48,
+    textAlignVertical: 'top',
+  },
+  bottomBarButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    backgroundColor: '#6c8bf0',
+  },
+  bottomBarButtonDisabled: {
+    backgroundColor: '#b8c4f5',
+  },
+  bottomBarButtonText: {
+    color: '#ffffff',
+    fontWeight: '600',
   },
   statusText: {
     color: '#2f6f4f',
